@@ -1,7 +1,10 @@
 import os
 import re
 import io
+import asyncio
+import threading
 import requests
+from flask import Flask, request
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -112,6 +115,966 @@ def parse_query(text):
     query = original
 
     for word in sorted(
+        remove_words,
+        key=len,
+        reverse=True
+    ):
+
+        query = re.sub(
+            r"\b" + re.escape(word) + r"\b",
+            " ",
+            query,
+            flags=re.IGNORECASE
+        )
+
+    query = re.sub(
+        r"\s+",
+        " ",
+        query
+    ).strip()
+
+    return query, device, quality
+
+
+# ==========================================
+# IMAGE QUALITY / RATIO FILTER
+# ==========================================
+
+def suitable_image(
+    item,
+    device,
+    quality
+):
+
+    width = item.get(
+        "original_width"
+    )
+
+    height = item.get(
+        "original_height"
+    )
+
+    try:
+        width = int(width)
+        height = int(height)
+
+    except:
+        return False
+
+    if width <= 0 or height <= 0:
+        return False
+
+    ratio = width / height
+
+    if device == "mobile":
+
+        if height <= width:
+            return False
+
+        if ratio < 0.40 or ratio > 0.80:
+            return False
+
+        if height < 1200:
+            return False
+
+        if (
+            quality == "4k"
+            and height < 1800
+        ):
+            return False
+
+        return True
+
+    if device == "desktop":
+
+        if width <= height:
+            return False
+
+        if ratio < 1.30 or ratio > 2.40:
+            return False
+
+        if width < 1400:
+            return False
+
+        if (
+            quality == "4k"
+            and width < 2500
+        ):
+            return False
+
+        return True
+
+    if min(width, height) < 900:
+        return False
+
+    if (
+        quality == "4k"
+        and max(width, height) < 2500
+    ):
+        return False
+
+    return True
+
+
+# ==========================================
+# PNG IMAGE FILTER
+# ==========================================
+
+def suitable_png(item):
+
+    width = item.get(
+        "original_width"
+    )
+
+    height = item.get(
+        "original_height"
+    )
+
+    try:
+        width = int(width)
+        height = int(height)
+
+    except:
+        return False
+
+    if width <= 0 or height <= 0:
+        return False
+
+    # Avoid extremely small images
+    if max(width, height) < 500:
+        return False
+
+    original = str(
+        item.get("original", "")
+    ).lower()
+
+    title = str(
+        item.get("title", "")
+    ).lower()
+
+    source = str(
+        item.get("source", "")
+    ).lower()
+
+    link = str(
+        item.get("link", "")
+    ).lower()
+
+    combined = (
+        original
+        + " "
+        + title
+        + " "
+        + source
+        + " "
+        + link
+    )
+
+    # Strong PNG signals
+    png_signals = [
+        ".png",
+        "png",
+        "transparent",
+        "no background",
+        "cutout",
+        "render",
+    ]
+
+    if any(
+        word in combined
+        for word in png_signals
+    ):
+        return True
+
+    # If no clear PNG signal, still allow
+    # reasonably large images because Google
+    # may not expose the file extension.
+    if min(width, height) >= 700:
+        return True
+
+    return False
+
+
+# ==========================================
+# GOOGLE IMAGES SEARCH - WALLPAPERS
+# ==========================================
+
+def google_images_search(
+    query,
+    device,
+    quality,
+    page
+):
+
+    search_query = query + " wallpaper"
+
+    if device == "mobile":
+        search_query += " mobile portrait"
+
+    elif device == "desktop":
+        search_query += " desktop landscape"
+
+    if quality == "4k":
+        search_query += " 4K"
+
+    params = {
+        "engine": "google_images",
+        "q": search_query,
+        "api_key": SERPAPI_KEY,
+        "safe": "active",
+        "hl": "en",
+        "gl": "us",
+        "ijn": page,
+    }
+
+    try:
+
+        response = requests.get(
+            "https://serpapi.com/search",
+            params=params,
+            timeout=TIMEOUT
+        )
+
+        if response.status_code != 200:
+            print(
+                "SerpApi HTTP:",
+                response.status_code
+            )
+            return []
+
+        data = response.json()
+
+    except Exception as e:
+
+        print(
+            "SerpApi error:",
+            e
+        )
+
+        return []
+
+    return data.get(
+        "images_results",
+        []
+    )
+
+
+# ==========================================
+# GOOGLE IMAGES SEARCH - PNG
+# ==========================================
+
+def google_png_search(
+    query,
+    page
+):
+
+    search_query = (
+        query
+        + " PNG transparent background"
+    )
+
+    params = {
+        "engine": "google_images",
+        "q": search_query,
+        "api_key": SERPAPI_KEY,
+        "safe": "active",
+        "hl": "en",
+        "gl": "us",
+        "ijn": page,
+    }
+
+    try:
+
+        response = requests.get(
+            "https://serpapi.com/search",
+            params=params,
+            timeout=TIMEOUT
+        )
+
+        if response.status_code != 200:
+
+            print(
+                "SerpApi PNG HTTP:",
+                response.status_code
+            )
+
+            return []
+
+        data = response.json()
+
+    except Exception as e:
+
+        print(
+            "SerpApi PNG error:",
+            e
+        )
+
+        return []
+
+    return data.get(
+        "images_results",
+        []
+    )
+
+
+# ==========================================
+# COLLECT WALLPAPER RESULTS
+# ==========================================
+
+def collect_results(
+    query,
+    device,
+    quality,
+    start_page=0
+):
+
+    collected = []
+
+    for page in range(
+        start_page,
+        start_page + 3
+    ):
+
+        images = google_images_search(
+            query,
+            device,
+            quality,
+            page
+        )
+
+        for item in images:
+
+            url = item.get(
+                "original"
+            )
+
+            if not url:
+                continue
+
+            if not suitable_image(
+                item,
+                device,
+                quality
+            ):
+                continue
+
+            collected.append(item)
+
+    return collected
+
+
+# ==========================================
+# COLLECT PNG RESULTS
+# ==========================================
+
+def collect_png_results(
+    query,
+    start_page=0
+):
+
+    collected = []
+
+    for page in range(
+        start_page,
+        start_page + 3
+    ):
+
+        images = google_png_search(
+            query,
+            page
+        )
+
+        for item in images:
+
+            url = item.get(
+                "original"
+            )
+
+            if not url:
+                continue
+
+            if not suitable_png(item):
+                continue
+
+            collected.append(item)
+
+    return collected
+
+
+# ==========================================
+# DUPLICATE FILTER
+# ==========================================
+
+def remove_duplicates(
+    items,
+    seen
+):
+
+    final = []
+
+    local_seen = set(seen)
+
+    for item in items:
+
+        url = item.get(
+            "original"
+        )
+
+        if not url:
+            continue
+
+        key = (
+            url
+            .split("?")[0]
+            .lower()
+            .strip()
+        )
+
+        if key in local_seen:
+            continue
+
+        local_seen.add(key)
+
+        final.append(item)
+
+    return final
+
+
+# ==========================================
+# REMOVE BACKGROUND API
+# ==========================================
+
+def remove_background(image_bytes):
+
+    if not REMOVE_BG_API_KEY:
+        return None, "API key is missing."
+
+    try:
+
+        response = requests.post(
+            "https://api.remove.bg/v1.0/removebg",
+            files={
+                "image_file": (
+                    "image.jpg",
+                    image_bytes,
+                    "image/jpeg"
+                )
+            },
+            data={
+                "size": "auto",
+                "format": "png"
+            },
+            headers={
+                "X-Api-Key": REMOVE_BG_API_KEY
+            },
+            timeout=60
+        )
+
+        if response.status_code == 200:
+            return response.content, None
+
+        print(
+            "Remove.bg HTTP:",
+            response.status_code,
+            response.text[:500]
+        )
+
+        return None, (
+            f"Remove.bg error "
+            f"{response.status_code}"
+        )
+
+    except Exception as e:
+
+        print(
+            "Remove.bg request error:",
+            e
+        )
+
+        return None, str(e)
+
+
+# ==========================================
+# SEND NEXT 5 WALLPAPERS
+# ==========================================
+
+async def send_five(
+    context,
+    user_id,
+    chat_id
+):
+
+    data = USER_SEARCHES.get(
+        user_id
+    )
+
+    if not data:
+        return
+
+    query = data["query"]
+    device = data["device"]
+    quality = data["quality"]
+
+    results = data["results"]
+    index = data["index"]
+
+    sent = 0
+
+    while sent < RESULTS_PER_PAGE:
+
+        if index >= len(results):
+
+            next_page = data[
+                "next_page"
+            ]
+
+            new_results = collect_results(
+                query,
+                device,
+                quality,
+                next_page
+            )
+
+            new_results = remove_duplicates(
+                new_results,
+                data["seen"]
+            )
+
+            data["next_page"] += 3
+
+            results.extend(
+                new_results
+            )
+
+            if not new_results:
+                break
+
+        if index >= len(results):
+            break
+
+        item = results[index]
+
+        index += 1
+
+        url = item.get(
+            "original"
+        )
+
+        if not url:
+            continue
+
+        key = (
+            url
+            .split("?")[0]
+            .lower()
+            .strip()
+        )
+
+        if key in data["seen"]:
+            continue
+
+        try:
+
+            width = item.get(
+                "original_width",
+                "?"
+            )
+
+            height = item.get(
+                "original_height",
+                "?"
+            )
+
+            caption = (
+                f"🖼️ {query}\n"
+                f"📐 {width}×{height}"
+            )
+
+            await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=url,
+                caption=caption
+            )
+
+            data["seen"].add(key)
+
+            sent += 1
+
+        except Exception as e:
+
+            print(
+                "Telegram image error:",
+                e
+            )
+
+            continue
+
+    data["index"] = index
+
+    if (
+        index < len(results)
+        or data["next_page"] < 12
+    ):
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "➕ More 5",
+                    callback_data="more5"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="main_menu"
+                )
+            ]
+        ]
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Want to explore more "
+                "wallpapers?"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
+        )
+
+    else:
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "ℹ️ No more suitable "
+                "results are available."
+            )
+        )
+
+
+# ==========================================
+# SEND NEXT 5 PNGs
+# ==========================================
+
+async def send_png_five(
+    context,
+    user_id,
+    chat_id
+):
+
+    data = USER_SEARCHES.get(
+        user_id
+    )
+
+    if not data:
+        return
+
+    query = data["query"]
+
+    results = data["results"]
+    index = data["index"]
+
+    sent = 0
+
+    while sent < RESULTS_PER_PAGE:
+
+        if index >= len(results):
+
+            next_page = data[
+                "next_page"
+            ]
+
+            new_results = collect_png_results(
+                query,
+                next_page
+            )
+
+            new_results = remove_duplicates(
+                new_results,
+                data["seen"]
+            )
+
+            data["next_page"] += 3
+
+            results.extend(
+                new_results
+            )
+
+            if not new_results:
+                break
+
+        if index >= len(results):
+            break
+
+        item = results[index]
+
+        index += 1
+
+        url = item.get(
+            "original"
+        )
+
+        if not url:
+            continue
+
+        key = (
+            url
+            .split("?")[0]
+            .lower()
+            .strip()
+        )
+
+        if key in data["seen"]:
+            continue
+
+        try:
+
+            width = item.get(
+                "original_width",
+                "?"
+            )
+
+            height = item.get(
+                "original_height",
+                "?"
+            )
+
+            caption = (
+                f"🖼️ PNG: {query}\n"
+                f"📐 {width}×{height}\n"
+                f"✨ Transparent PNG search"
+            )
+
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=url,
+                caption=caption
+            )
+
+            data["seen"].add(key)
+
+            sent += 1
+
+        except Exception as e:
+
+            print(
+                "Telegram PNG error:",
+                e
+            )
+
+            # Some servers don't allow
+            # Telegram to download the
+            # original URL as document.
+            # Try sending as photo instead.
+
+            try:
+
+                await context.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=url,
+                    caption=(
+                        f"🖼️ PNG: {query}\n"
+                        f"📐 {width}×{height}"
+                    )
+                )
+
+                data["seen"].add(key)
+
+                sent += 1
+
+            except Exception as e2:
+
+                print(
+                    "Telegram PNG photo error:",
+                    e2
+                )
+
+                continue
+
+    data["index"] = index
+
+    if (
+        index < len(results)
+        or data["next_page"] < 12
+    ):
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "➕ More 5",
+                    callback_data="png_more5"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏠 Main Menu",
+                    callback_data="main_menu"
+                )
+            ]
+        ]
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "Want more PNG images?"
+            ),
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
+        )
+
+    else:
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "ℹ️ No more suitable "
+                "PNG results are available."
+            )
+        )
+
+
+# ==========================================
+# MAIN MENU
+# ==========================================
+
+async def show_main_menu(
+    update,
+    context,
+    edit=False
+):
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🖼️ Wallpaper Search",
+                callback_data="wallpaper_mode"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🖼️ PNG Images",
+                callback_data="png_mode"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✂️ Remove Background",
+                callback_data="remove_bg_mode"
+            )
+        ],
+    ]
+
+    text = (
+        "✨ FHD Wallpapers Bot\n\n"
+        "Choose what you want to search:\n\n"
+        "🖼️ Wallpaper Search\n"
+        "Search HD & 4K wallpapers.\n\n"
+        "🖼️ PNG Images\n"
+        "Search PNG & transparent images.\n\n"
+        "✂️ Remove Background\n"
+        "Remove photo background and get a transparent PNG."
+    )
+
+    if edit:
+
+        await update.callback_query.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
+        )
+
+    else:
+
+        await update.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(
+                keyboard
+            )
+        )
+
+
+# ==========================================
+# START
+# ==========================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+
+    USER_MODES[user_id] = "wallpaper"
+
+    await show_main_menu(
+        update,
+        context
+    )
+
+
+# ==========================================
+# REMOVE BACKGROUND PHOTO HANDLER
+# ==========================================
+
+async def handle_photo(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    mode = USER_MODES.get(
+        user_id,
+        "wallpaper"
+    )
+
+    if mode != "remove_bg":
+        return
+
+    status = await update.message.reply_text(
+        "✂️ Removing background...\n\n"
+        "⏳ Please wait."
+    )
+
+    try:
+
+        photo = update.message.photo[-1]
+
+        telegram_file = await context.bot.get_file(
+            photo.file_id
+        )
+
+        image_bytes = await telegram_file.download_as_bytearray()
+
+        result, error = remove_background(
+            bytes(image_bytes)
+        )
+
+        if not result:
+
+            await status.edit_text(
+                "❌ Background removal failed.\n\n"
+                f"Reason: {error}"
+            )
+
+            return
+
+        await status.edit_text(
+            "✅ Background removed!\n\n"
+            "📤 Sending transparent PNG..."
+        )
+
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(result),
+            filename="no_background.png",
+            caption=(
+                "✂️ Background Removed\n"
+                   for word in sorted(
         remove_words,
         key=len,
         reverse=True
