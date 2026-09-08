@@ -1,4 +1,0 @@
-python-telegram-bot==22.8
-requests
-Flask
-gunicorn
