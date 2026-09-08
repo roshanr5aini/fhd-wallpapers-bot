@@ -1,5 +1,6 @@
-python-telegram-bot
-Flask
+python-telegram-bot==22.8
 requests
+Flask
+gunicorn
 reportlab
 python-docx
